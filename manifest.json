@@ -22,8 +22,8 @@
     "service_worker": "sw.js",
     "type": "module"
   },
-  "permissions": ["storage", "tabs", "scripting", "alarms"],
-  "optional_host_permissions": ["https://right.codes/*"],
+  "permissions": ["storage", "tabs", "scripting", "alarms", "declarativeNetRequest"],
+  "optional_host_permissions": ["https://right.codes/*", "https://www.right.codes/*"],
   "side_panel": {
     "default_path": "ui/panel.html"
   }

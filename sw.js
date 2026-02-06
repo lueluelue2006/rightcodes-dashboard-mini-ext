@@ -1,10 +1,16 @@
-const DASHBOARD_URL = "https://right.codes/dashboard";
-const RIGHTCODES_ORIGINS = ["https://right.codes/*"];
+const DASHBOARD_URL = "https://www.right.codes/dashboard";
+const RIGHTCODES_ORIGINS = ["https://right.codes/*", "https://www.right.codes/*"];
 
 const DATA_KEY = "rcdm_data";
 const LAST_ERROR_KEY = "rcdm_last_error";
 const PREFS_KEY = "rcdm_prefs";
 const AUTO_REFRESH_ALARM = "rcdm_auto_refresh";
+const TEMP_TAB_BLOCK_RULE_ID = 30001;
+const MIN_REFRESH_GAP_MS = 2_500;
+const REMOTE_RATE_LIMIT_COOLDOWN_MS = 65_000;
+
+let inFlightRefreshPromise = null;
+let nextAllowedRefreshAt = 0;
 
 const DEFAULT_PREFS = {
   autoRefresh: false,
@@ -41,21 +47,21 @@ async function hasRightCodesPermission() {
 }
 
 async function findExistingDashboardTab() {
-  const tabs = await chrome.tabs.query({ url: "https://right.codes/dashboard*" });
+  const tabs = await chrome.tabs.query({ url: ["https://right.codes/dashboard*", "https://www.right.codes/dashboard*"] });
   return tabs.find((t) => typeof t.id === "number") || null;
 }
 
-function waitForTabComplete(tabId, timeoutMs = 60_000) {
+function waitForTabUrl(tabId, pattern, timeoutMs = 20_000) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(onUpdated);
-      reject(new Error("timeout_waiting_for_tab_complete"));
+      reject(new Error("timeout_waiting_for_tab_url"));
     }, timeoutMs);
 
     async function maybeResolveNow() {
       try {
         const tab = await chrome.tabs.get(tabId);
-        if (tab?.status === "complete") {
+        if (pattern.test(String(tab?.url || ""))) {
           clearTimeout(timeout);
           chrome.tabs.onUpdated.removeListener(onUpdated);
           resolve(tab);
@@ -67,7 +73,8 @@ function waitForTabComplete(tabId, timeoutMs = 60_000) {
 
     function onUpdated(updatedTabId, changeInfo, tab) {
       if (updatedTabId !== tabId) return;
-      if (changeInfo.status !== "complete") return;
+      const url = String(changeInfo.url || tab?.url || "");
+      if (!pattern.test(url)) return;
       clearTimeout(timeout);
       chrome.tabs.onUpdated.removeListener(onUpdated);
       resolve(tab);
@@ -78,7 +85,95 @@ function waitForTabComplete(tabId, timeoutMs = 60_000) {
   });
 }
 
+async function installTempTabLightModeRule(tabId) {
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [TEMP_TAB_BLOCK_RULE_ID],
+    addRules: [
+      {
+        id: TEMP_TAB_BLOCK_RULE_ID,
+        priority: 1,
+        action: { type: "block" },
+        condition: {
+          tabIds: [tabId],
+          regexFilter: "^https://(www\\.)?right\\.codes/",
+          resourceTypes: ["image", "font", "media"]
+        }
+      }
+    ]
+  });
+}
+
+async function clearTempTabLightModeRule() {
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [TEMP_TAB_BLOCK_RULE_ID]
+  });
+}
+
+async function executeExtractWithRetry(tabId, maxAttempts = 4) {
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (!tab) throw new Error("tab_not_found");
+
+      const injected = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: extractRightCodesDashboard
+      });
+
+      return injected?.[0]?.result;
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err?.message || err || "");
+      const retryable =
+        msg.includes("Frame with ID 0 was removed") ||
+        msg.includes("No frame with id") ||
+        msg.includes("The tab was closed") ||
+        msg.includes("Cannot access contents of url");
+
+      if (!retryable || attempt === maxAttempts) break;
+      await sleep(220 * attempt);
+    }
+  }
+
+  throw lastErr || new Error("extract_retry_failed");
+}
+
+async function extractDashboardWithResultRetry(tabId, maxAttempts = 3) {
+  let lastResult = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const result = await executeExtractWithRetry(tabId);
+    lastResult = result;
+
+    if (result?.ok) return result;
+
+    const detail = String(result?.error || "").toLowerCase();
+    const retryableResult = detail.includes("main_not_found") || detail.includes("dashboard_data_not_ready");
+    if (!retryableResult || attempt === maxAttempts) return result;
+
+    await sleep(300 * attempt);
+  }
+
+  return lastResult;
+}
+
 async function refreshDashboardData({ reason }) {
+  const now = Date.now();
+  if (now < nextAllowedRefreshAt) {
+    const error = {
+      at: new Date().toISOString(),
+      reason,
+      code: "rate_limited_local",
+      detail: `cooldown_until_${new Date(nextAllowedRefreshAt).toISOString()}`
+    };
+    await chrome.storage.local.set({ [LAST_ERROR_KEY]: error });
+    return { ok: false, error };
+  }
+
+  nextAllowedRefreshAt = now + MIN_REFRESH_GAP_MS;
+
   const hasPerm = await hasRightCodesPermission();
   if (!hasPerm) {
     const error = { at: new Date().toISOString(), reason, code: "missing_host_permission" };
@@ -103,20 +198,30 @@ async function refreshDashboardData({ reason }) {
   }
 
   try {
-    await waitForTabComplete(tab.id);
+    if (createdTempTab) {
+      try {
+        await installTempTabLightModeRule(tab.id);
+      } catch {
+        // ignore rule install failure, continue with normal mode
+      }
+    }
 
-    const injected = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: extractRightCodesDashboard
-    });
+    await waitForTabUrl(tab.id, /^https:\/\/(www\.)?right\.codes\/dashboard/i);
+    await sleep(120);
 
-    const result = injected?.[0]?.result;
+    const result = await extractDashboardWithResultRetry(tab.id);
     if (!result || !result.ok) {
+      const detail = result?.error || result;
+      const detailText = String(detail || "").toLowerCase();
+      if (detailText.includes("too_many_requests") || detailText.includes("too many requests")) {
+        nextAllowedRefreshAt = Math.max(nextAllowedRefreshAt, Date.now() + REMOTE_RATE_LIMIT_COOLDOWN_MS);
+      }
+
       const error = {
         at: new Date().toISOString(),
         reason,
         code: "extract_failed",
-        detail: result?.error || result
+        detail
       };
       await chrome.storage.local.set({ [LAST_ERROR_KEY]: error });
       return { ok: false, error };
@@ -134,6 +239,14 @@ async function refreshDashboardData({ reason }) {
     await chrome.storage.local.set({ [LAST_ERROR_KEY]: error });
     return { ok: false, error };
   } finally {
+    if (createdTempTab) {
+      try {
+        await clearTempTabLightModeRule();
+      } catch {
+        // ignore
+      }
+    }
+
     if (createdTempTab && prefs.closeTempTab) {
       try {
         await chrome.tabs.remove(tab.id);
@@ -162,12 +275,42 @@ async function extractRightCodesDashboard() {
   }
 
   try {
-    const main = await waitFor(() => document.querySelector("main"));
+    if (String(location.pathname || "").startsWith("/login")) {
+      return { ok: false, error: "auth_required", fetchedAt };
+    }
+
+    const bodyTextEarly = normalize(document.body?.innerText || document.body?.textContent || "").toLowerCase();
+    if (
+      bodyTextEarly.includes("too many requests") ||
+      bodyTextEarly.includes("查询请求过于频繁") ||
+      bodyTextEarly.includes("每分钟最多30次")
+    ) {
+      return { ok: false, error: "too_many_requests", fetchedAt };
+    }
+
+    const main = await waitFor(() => document.querySelector("main, #root"), { timeoutMs: 20_000 });
     if (!main) {
+      const bodyTextLate = normalize(document.body?.innerText || document.body?.textContent || "").toLowerCase();
+      if (
+        bodyTextLate.includes("too many requests") ||
+        bodyTextLate.includes("查询请求过于频繁") ||
+        bodyTextLate.includes("每分钟最多30次")
+      ) {
+        return { ok: false, error: "too_many_requests", fetchedAt };
+      }
+
+      if (
+        String(location.pathname || "").startsWith("/login") ||
+        bodyTextLate.includes("使用 linux do 登录") ||
+        bodyTextLate.includes("还没有账号")
+      ) {
+        return { ok: false, error: "auth_required", fetchedAt };
+      }
+
       return { ok: false, error: "main_not_found", fetchedAt };
     }
 
-    const mainText = normalize(main.textContent);
+    const mainText = normalize((document.querySelector("main") || document.body || main).textContent);
     const balanceMatch = mainText.match(/余额\s*[:：]\s*\$\s*([0-9.]+)/);
     const balance = {
       raw: balanceMatch ? `$${balanceMatch[1]}` : null,
@@ -176,7 +319,7 @@ async function extractRightCodesDashboard() {
 
     // Subscriptions cards
     const subGrid = await waitFor(() =>
-      document.querySelector("main .mb-8 .grid.grid-cols-1.sm\\:grid-cols-2.lg\\:grid-cols-3")
+      document.querySelector(".mb-8 .grid.grid-cols-1.sm\\:grid-cols-2.lg\\:grid-cols-3")
     );
     const subscriptions = [];
     if (subGrid) {
@@ -247,7 +390,7 @@ async function extractRightCodesDashboard() {
     // Totals cards
     const totals = {};
     const totalsGrid = await waitFor(() =>
-      document.querySelector("main .grid.grid-cols-1.sm\\:grid-cols-3.gap-4.mb-6")
+      document.querySelector(".grid.grid-cols-1.sm\\:grid-cols-3.gap-4.mb-6")
     );
     if (totalsGrid) {
       for (const card of Array.from(totalsGrid.children)) {
@@ -256,6 +399,10 @@ async function extractRightCodesDashboard() {
         if (!label) continue;
         totals[label] = value || null;
       }
+    }
+
+    if (!balance?.raw && subscriptions.length === 0 && Object.keys(totals).length === 0) {
+      return { ok: false, error: "dashboard_data_not_ready", fetchedAt };
     }
 
     return {
@@ -296,7 +443,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.type === "rcdm_refresh") {
     void (async () => {
-      const res = await refreshDashboardData({ reason: message.reason || "manual" });
+      if (!inFlightRefreshPromise) {
+        inFlightRefreshPromise = refreshDashboardData({ reason: message.reason || "manual" }).finally(() => {
+          inFlightRefreshPromise = null;
+        });
+      }
+      const res = await inFlightRefreshPromise;
       sendResponse(res);
     })();
     return true;

@@ -1,5 +1,5 @@
-const DASHBOARD_URL = "https://right.codes/dashboard";
-const ORIGINS = ["https://right.codes/*"];
+const DASHBOARD_URL = "https://www.right.codes/dashboard";
+const ORIGINS = ["https://right.codes/*", "https://www.right.codes/*"];
 
 const DATA_KEY = "rcdm_data";
 const LAST_ERROR_KEY = "rcdm_last_error";
